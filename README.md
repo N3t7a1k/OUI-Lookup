@@ -54,6 +54,9 @@ To use the OUI Lookup Web Service, follow these steps:
 ### Environment Configurations
 The project root directory contains a .env file with the following configuration:
 ```
+HOST=0.0.0.0
+PORT=5000
+WORKERS=4
 ALLOWED_CORS_DOMAINS=oui.n3t7a1k.io
 ```
 
