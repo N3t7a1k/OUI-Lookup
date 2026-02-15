@@ -1,273 +1,158 @@
-import click
-import json
-import logging
 import os
-import pandas as pd
+import logging
+import time
 import requests
-from calendar import timegm
-from datetime import datetime
-from flask import Flask, request, send_from_directory
-from flask_cors import CORS
+import pandas as pd
+import click
 from io import StringIO
 from pathlib import Path
-from threading import Timer
-import time
+from threading import Lock, Thread
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO)
-db_update_interval = 604800
-mal_db_url = 'https://standards-oui.ieee.org/oui/oui.csv'
-mam_db_url = 'https://standards-oui.ieee.org/oui28/mam.csv'
-mas_db_url = 'https://standards-oui.ieee.org/oui36/oui36.csv'
-default_limit = 10
-headers = {
-    'User-Agent': 'curl/7.68.0',
-    'Accept': '*/*'
-}
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-working_dir = Path(__file__).parent.resolve()
-data_dir = working_dir / 'data'
-init_timer = None
-is_initializing = False
-mal_db = None
-mam_db = None
-mas_db = None
-app = Flask(__name__)
+class OUIDataManager:
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
+        self.data_dir.mkdir(exist_ok=True)
+        self.cache_path = self.data_dir / "oui_cache.pkl"
+        self.df = None
+        self.lock = Lock()
+        self.urls = [
+            'https://standards-oui.ieee.org/oui/oui.csv',
+            'https://standards-oui.ieee.org/oui28/mam.csv',
+            'https://standards-oui.ieee.org/oui36/oui36.csv'
+        ]
+        self.load_from_cache()
 
-def download_with_retry(url, retries=3, delay=5):
-    for i in range(retries):
-        try:
-            response = requests.get(url, headers=headers)
-            if response.ok:
-                return response.text
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Download failed: {e}")
-        time.sleep(delay)
-    raise Exception(f"Failed to download file after {retries} attempts")
+    def is_ready(self):
+        return self.df is not None
 
-def init():
-    init_cors()
-    init_db()
-
-def init_cors():
-    cors_domains = os.environ.get('ALLOWED_CORS_DOMAINS')
-    if cors_domains:
-        allowed_origins = [f"http://{domain}" for domain in cors_domains.split(',')] + \
-                          [f"https://{domain}" for domain in cors_domains.split(',')]
-        CORS(app, resources={r"/*": {"origins": allowed_origins}})
-    else:
-        CORS(app)
-
-def init_db():
-    global is_initializing, init_timer, mal_db, mam_db, mas_db
-    is_initializing = True
-    logging.info('Initializing the server')
-    if not data_dir.is_dir():
-        os.mkdir(data_dir)
-
-    update_db = True
-    mal_file = data_dir / 'mal.csv'
-    mam_file = data_dir / 'mam.csv'
-    mas_file = data_dir / 'mas.csv'
-    current_time = datetime.utcnow()
-    last_update = data_dir / 'last_update.txt'
-    elapsed_time = 0
-    if last_update.is_file():
-        try:
-            timestamp = datetime.utcfromtimestamp(int(last_update.read_text()))
-            logging.debug(f'Last OUI DB update time is {timestamp}')
-            elapsed_time = (current_time - timestamp).seconds
-            if mal_file.exists() and mam_file.exists() and mas_file.exists() and elapsed_time < db_update_interval:
-                update_db = False
-        except:
-            os.remove(last_update)
-
-    if update_db:
-        logging.debug('Updating and loading OUI DB')
-        last_update.write_text(str(timegm(current_time.utctimetuple())))
-        try:
-            logging.debug('Downloading MA-L DB')
-            mal_csv_content = download_with_retry(mal_db_url)
-            mal_db = pd.read_csv(StringIO(mal_csv_content))
-            if 'Assignment' not in mal_db.columns:
-                raise KeyError("'Assignment' column is missing in MA-L DB")
-            mal_db = mal_db.sort_values('Assignment').reset_index(drop=True)
-            mal_db.to_csv(mal_file, index=False)
-            logging.debug(f'Successfully saved MA-L DB to {mal_file.absolute()}')
-
-            logging.debug('Downloading MA-M DB')
-            mam_csv_content = download_with_retry(mam_db_url)
-            mam_db = pd.read_csv(StringIO(mam_csv_content))
-            if 'Assignment' not in mam_db.columns:
-                raise KeyError("'Assignment' column is missing in MA-M DB")
-            mam_db = mam_db.sort_values('Assignment').reset_index(drop=True)
-            mam_db.to_csv(mam_file, index=False)
-            logging.debug(f'Successfully saved MA-M DB to {mam_file.absolute()}')
-
-            logging.debug('Downloading MA-S DB')
-            mas_csv_content = download_with_retry(mas_db_url)
-            mas_db = pd.read_csv(StringIO(mas_csv_content))
-            if 'Assignment' not in mas_db.columns:
-                raise KeyError("'Assignment' column is missing in MA-S DB")
-            mas_db = mas_db.sort_values('Assignment').reset_index(drop=True)
-            mas_db.to_csv(mas_file, index=False)
-            logging.debug(f'Successfully saved MA-S DB to {mas_file.absolute()}')
-
-        except Exception as e:
-            logging.error(f"Failed to update and load OUI DB: {e}")
-            raise
-    else:
-        logging.debug('Loading OUI DB')
-        mal_db = pd.read_csv(mal_file)
-        mam_db = pd.read_csv(mam_file)
-        mas_db = pd.read_csv(mas_file)
-
-    logging.info('Server initialized successfully')
-    init_timer = Timer(db_update_interval - elapsed_time, init)
-    init_timer.start()
-    is_initializing = False
-
-def is_hex(input: str):
-    if len(input) < 1:
+    def load_from_cache(self):
+        if self.cache_path.exists():
+            try:
+                mtime = datetime.fromtimestamp(self.cache_path.stat().st_mtime)
+                if (datetime.now() - mtime).days < 7:
+                    with self.lock:
+                        self.df = pd.read_pickle(self.cache_path)
+                    return True
+            except Exception:
+                pass
         return False
-    for c in input:
-        if not (c.isdigit() or ('A' <= c <= 'F') or ('a' <= c <= 'f')):
-            return False
-    return True
 
-def get_mac(input: str):
-    if len(input) < 1:
-        return None
-    mac = input.replace(':', '').replace('-', '').upper()
-    if len(mac) > 12:
-        return None
-    if not is_hex(mac):
-        return None
-    return mac
+    def update_loop(self):
+        while True:
+            if self.is_ready() and self.cache_path.exists():
+                 mtime = datetime.fromtimestamp(self.cache_path.stat().st_mtime)
+                 if (datetime.now() - mtime).days < 7:
+                     time.sleep(3600)
+                     continue
 
-def search_mac(query, page=None, limit=None):
-    res_data = {}
-    if 6 <= len(query) <= 17:
-        mac = get_mac(query)
-        if mac is None:
-            raise
-        mac_len = len(mac)
+            try:
+                temp_dfs = []
+                for url in self.urls:
+                    try:
+                        res = requests.get(url, headers={'User-Agent': 'curl/7.68.0'}, timeout=30)
+                        if res.ok:
+                            df = pd.read_csv(StringIO(res.text))
+                            cols = [c for c in df.columns if c in ['Assignment', 'Organization Name', 'Organization Address']]
+                            if len(cols) >= 2:
+                                temp_dfs.append(df[cols])
+                    except Exception:
+                        pass
 
-        search_result = mal_db[mal_db['Assignment'].str.startswith(mac[:6])]
+                if temp_dfs:
+                    combined = pd.concat(temp_dfs, ignore_index=True)
+                    combined['clean_mac'] = combined['Assignment'].astype(str).str.replace(r'[:\-]', '', regex=True).str.upper()
+                    
+                    with self.lock:
+                        self.df = combined
+                        self.df.to_pickle(self.cache_path)
+                
+            except Exception:
+                pass
+            
+            time.sleep(604800) 
 
-        result_count = len(search_result.index)
-        if result_count < 1 or search_result['Organization Name'].iloc[0] == 'IEEE Registration Authority':
-            search_result = []
-            search_result.append(mam_db[mam_db['Assignment'].str.startswith(mac[:mac_len if mac_len < 7 else 7])])
-            search_result.append(mas_db[mas_db['Assignment'].str.startswith(mac[:mac_len if mac_len < 9 else 9])])
-            search_result = pd.concat(search_result, axis=0, ignore_index=True)
-            result_count = len(search_result.index)
+    def search(self, query: str, page: int, limit: int):
+        if self.df is None:
+            return None
 
-        if result_count < 1:
-            res_data['count'] = 0
-            if mac[1] in ('2', '6', 'A', 'E'):
-                res_data['info'] = 'This MAC address is randomly generated.'
-            else:
-                res_data['info'] = "No OUI information found for the given MAC address."
+        query = query.strip()
+        clean_query = query.replace(':', '').replace('-', '').upper()
+        
+        is_hex = all(c in '0123456789ABCDEF' for c in clean_query)
+        is_mac_search = is_hex and len(clean_query) >= 2
+
+        if is_mac_search:
+            mask = self.df['clean_mac'].str.startswith(clean_query, na=False)
+            results = self.df[mask]
         else:
-            res_data['total'] = result_count
-            if page is not None and limit is not None:
-                data = search_result.iloc[(page - 1) * limit: page * limit].to_dict('records')
-            else:
-                data = search_result.to_dict('records')
-            result_count = len(data)
-            if result_count > 0:
-                res_data['count'] = result_count
-                res_data['data'] = data
-            else:
-                res_data['info'] = "No more OUI information found for the given MAC address."
-    else:
-        raise
-    return res_data
+            results = self.df[self.df['Organization Name'].str.contains(query, case=False, na=False)]
 
-def search_organization_name(query, page=None, limit=None):
-    res_data = {}
-    search_result = []
-    search_result.append(mal_db[mal_db['Organization Name'].str.contains(query, False)])
-    search_result.append(mam_db[mam_db['Organization Name'].str.contains(query, False)])
-    search_result.append(mas_db[mas_db['Organization Name'].str.contains(query, False)])
-    search_result = pd.concat(search_result, axis=0, ignore_index=True)
-    result_count = len(search_result.index)
+        total = len(results)
+        start = (page - 1) * limit
+        end = start + limit
+        
+        safe_df = results.iloc[start:end].fillna('')
+        
+        return {
+            "meta": {
+                "total": total,
+                "page": page,
+                "limit": limit,
+                "type": "MAC" if is_mac_search else "ORG"
+            },
+            "data": safe_df.to_dict('records')
+        }
 
-    if result_count < 1:
-        res_data['count'] = 0
-        res_data['info'] = "No OUI information found for the given organization name."
-    else:
-        res_data['total'] = result_count
-        if page is not None and limit is not None:
-            data = search_result.iloc[(page - 1) * limit: page * limit].to_dict('records')
-        else:
-            data = search_result.to_dict('records')
-        result_count = len(data)
-        if result_count > 0:
-            res_data['count'] = result_count
-            res_data['data'] = data
-        else:
-            res_data['info'] = "No more OUI information found for the given organization name."
+app = Flask(__name__)
+manager = OUIDataManager(Path(__file__).parent / 'data')
 
-    return res_data
+@app.route('/oui', methods=['GET'])
+def get_oui():
+    if not manager.is_ready():
+        return jsonify({"error": "Initializing database"}), 503
 
-def search_oui_info(query, page=None, limit=None):
+    query = request.args.get('q')
+    if not query:
+        return jsonify({"error": "Missing 'q' parameter"}), 400
+    
     try:
-        return search_mac(query, page, limit)
-    except:
-        return search_organization_name(query, page, limit)
+        page = max(1, request.args.get('page', 1, type=int))
+        limit = max(1, request.args.get('limit', 10, type=int))
+        
+        result = manager.search(query, page, limit)
+        
+        if not result or result['meta']['total'] == 0:
+            return jsonify({
+                "meta": {"total": 0, "page": page, "limit": limit}, 
+                "data": []
+            }), 404
+            
+        return jsonify(result), 200
 
-@app.route('/<argument>')
-def get_oui_info(argument):
-    global is_initializing
-
-    if is_initializing:
-        return '', 503
-
-    page = request.args.get('page', default=None, type=int)
-    limit = request.args.get('limit', default=None, type=int)
-
-    if page is None and limit is not None:
-        page = 1
-    elif page is not None:
-        if limit is None:
-            limit = default_limit
-        if page < 1:
-            page = 1
-
-    res_data = search_oui_info(argument, page, limit)
-    res_code = 200
-    res_header = {'Content-Type': 'application/json; charset=utf-8'}
-
-    res_data = json.dumps(res_data)
-
-    return res_data, res_code, res_header
-
-@app.route('/')
-def root():
-    return '', 400, {}
+    except Exception:
+        return jsonify({"error": "Internal Server Error"}), 500
 
 @click.command()
-@click.option('--verbose', '-v', is_flag=True, default=False, help='Get detailed log including debug messages')
-@click.option('--host', '-l', default='0.0.0.0', help='Host of the web server')
-@click.option('--port', '-p', default=5000, help='Port of the HTTP server')
-@click.option('--debug', '-d', is_flag=True, default=False, help='Set debug mode')
-@click.option('--cors', '-c', multiple=True, help='Allowed CORS domains (can specify multiple)')
-def main(verbose, host, port, debug, cors):
-    global init_timer
+@click.option('--port', default=5000)
+@click.option('--host', default='0.0.0.0')
+@click.option('--cors-domains', default='*')
+def main(port, host, cors_domains):
+    if cors_domains == '*':
+        CORS(app)
+    else:
+        origins = cors_domains.split(',')
+        CORS(app, origins=origins)
 
-    if verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    app.config['DEBUG'] = debug
-
-    if cors:
-        cors_env = ','.join(cors)
-        os.environ['ALLOWED_CORS_DOMAINS'] = cors_env
-
-    init()
-    app.run(host=host, port=port, debug=debug)
-    init_timer.cancel()
+    updater = Thread(target=manager.update_loop, daemon=True)
+    updater.start()
+    
+    app.run(host=host, port=port)
 
 if __name__ == "__main__":
     main()

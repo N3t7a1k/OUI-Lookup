@@ -9,8 +9,9 @@ flask = "*"
 flask_cors = "*"
 pandas = "*"
 requests = "*"
+gunicorn = "*"
 
 [dev-packages]
 
 [requires]
-python_version = "3.10"
+python_version = "3.13"

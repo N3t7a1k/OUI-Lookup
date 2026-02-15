@@ -1,4 +1,4 @@
-FROM python:3.10
+FROM python:3.13
 WORKDIR /app
 
 ENV HOST=0.0.0.0
@@ -11,5 +11,5 @@ COPY . .
 
 EXPOSE ${PORT}
 
-CMD pipenv run gunicorn -w ${WORKERS} -b ${HOST}:${PORT} --preload wsgi:app
+CMD ["pipenv", "run", "gunicorn", "-w", "${WORKERS}", "-b", "${HOST}:${PORT}", "--preload", "wsgi:app"]
 
